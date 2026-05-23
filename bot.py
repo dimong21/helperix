@@ -1,18 +1,20 @@
 import asyncio
 import sqlite3
-import re
 import json
 import time
+import re
 from datetime import datetime
 from pytz import timezone as tz, UTC
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from config import BOT_TOKEN
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+BOT_NAME = "Chaterix"
+BOT_USERNAME = "@chaterix_bot"
 
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
@@ -27,7 +29,9 @@ def init_db():
             timezone TEXT DEFAULT 'UTC',
             media_mode TEXT DEFAULT 'simple',
             schedule_enabled INTEGER DEFAULT 0,
-            prefix TEXT DEFAULT '.'
+            prefix TEXT DEFAULT '.',
+            is_connected INTEGER DEFAULT 0,
+            welcome_sent INTEGER DEFAULT 0
         )
     """)
     c.execute("""
@@ -90,7 +94,9 @@ def get_user(user_id):
         "timezone": user[4],
         "media_mode": user[5],
         "schedule_enabled": bool(user[6]),
-        "prefix": user[7]
+        "prefix": user[7],
+        "is_connected": bool(user[8]),
+        "welcome_sent": bool(user[9])
     }
 
 def update_user(user_id, **kwargs):
@@ -299,7 +305,6 @@ async def process_and_reply(message: types.Message):
     
     update_stats(user_id, received=True)
     
-    # Медиа режим simple: ответ по умолчанию на медиа
     if user["media_mode"] == "simple" and (message.photo or message.voice or message.video or message.document):
         media_response = "📎 Медиафайл принят, отвечу позже"
         if message.photo:
@@ -314,12 +319,10 @@ async def process_and_reply(message: types.Message):
         update_stats(user_id, answered=True)
         return
     
-    # Проверяем правила
     rules = get_rules(user_id)
     is_q = is_question(message.text or "")
     is_u = is_urgent(message.text or "")
     
-    # Сортируем правила по приоритету и проверяем
     for rule in sorted(rules, key=lambda x: x["priority"]):
         if check_rule_condition(rule, message, is_q, is_u):
             if rule["cooldown"] > 0 and not check_cooldown(rule, message.chat.id):
@@ -329,7 +332,6 @@ async def process_and_reply(message: types.Message):
             update_stats(user_id, answered=True)
             return
     
-    # Проверяем расписание
     if user["schedule_enabled"]:
         schedule = get_schedule(user_id)
         schedule_response = get_time_based_response(user_id, user, schedule)
@@ -338,14 +340,55 @@ async def process_and_reply(message: types.Message):
             update_stats(user_id, answered=True)
             return
     
-    # Базовые режимы
     if user["mode"] == "auto":
         await message.reply(user["default_text"])
         update_stats(user_id, answered=True)
     elif user["mode"] == "smart" and is_q:
         await message.reply(user["default_text"])
         update_stats(user_id, answered=True)
-    # silent mode = не отвечаем
+
+# Обработка подключения/отключения через автоматизацию чатов
+@dp.chat_member()
+async def chat_member_update(update: types.ChatMemberUpdated):
+    # Когда бота добавляют в чат или подключают через автоматизацию
+    user_id = update.from_user.id
+    user = get_user(user_id)
+    
+    # Проверяем, что бота подключили к пользователю
+    if update.new_chat_member and update.new_chat_member.status == "administrator":
+        if not user["welcome_sent"]:
+            update_user(user_id, is_connected=True, welcome_sent=True)
+            prefix = user["prefix"]
+            await bot.send_message(
+                user_id,
+                f"✅ *{BOT_NAME} успешно подключён!*\n\n"
+                f"Я буду отвечать в твоих чатах согласно настройкам.\n\n"
+                f"📌 *Управление:*\n"
+                f"• {prefix}help — список команд\n"
+                f"• {prefix}guide — как настроить доступ\n"
+                f"• {prefix}on / {prefix}off — включить/выключить меня\n\n"
+                f"💡 *Важно:* Ты всегда можешь отключить меня в *Настройки → Автоматизация чатов*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    # Если бота отключили
+    elif update.old_chat_member and update.old_chat_member.status == "administrator":
+        if update.new_chat_member is None or update.new_chat_member.status != "administrator":
+            update_user(user_id, is_connected=False)
+            prefix = user["prefix"]
+            await bot.send_message(
+                user_id,
+                f"❌ *{BOT_NAME} отключён от твоих чатов*\n\n"
+                f"💔 Сожалею о покидании!\n\n"
+                f"Чтобы вернуть меня:\n"
+                f"1. Настройки Telegram → Автоматизация чатов\n"
+                f"2. Подключи {BOT_USERNAME} заново\n\n"
+                f"А пока я здесь, ты можешь управлять мной командами:\n"
+                f"{prefix}on — включить ответы\n"
+                f"{prefix}off — выключить\n"
+                f"{prefix}status — текущий статус",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
 @dp.message(F.chat.type == "private")
 async def private_messages(message: types.Message):
@@ -354,21 +397,18 @@ async def private_messages(message: types.Message):
     prefix = user["prefix"]
     text = message.text or ""
     
-    # Обработка команд с текущим префиксом
     if text.startswith(prefix):
         await handle_commands(message, prefix)
     elif text.startswith("/") and prefix != "/":
-        # Если префикс не /, то / команды не работают (кроме /start для инициализации)
         if text == "/start":
             await handle_commands(message, "/")
         else:
-            await message.reply(f"❓ Неизвестная команда. Используйте '{prefix}' перед командами\nПример: {prefix}help")
+            await message.reply(f"❓ Неизвестная команда.\n\nИспользуйте *{prefix}* перед командами\nПример: `{prefix}help`\n\nИли смените префикс: `{prefix}prefix /`", parse_mode=ParseMode.MARKDOWN)
     elif not text.startswith("/"):
-        await message.reply(f"❓ Неизвестная команда. Используйте '{prefix}' перед командами\nПример: {prefix}help")
+        await message.reply(f"❓ Неизвестная команда.\n\nВсе команды начинаются с *{prefix}*\nПример: `{prefix}help`\n\nУзнать текущий префикс: `{prefix}status`", parse_mode=ParseMode.MARKDOWN)
 
 @dp.message()
 async def all_messages(message: types.Message):
-    # Сообщение из чата (не из ЛС) - обрабатываем как запрос на ответ
     if message.chat.type != "private":
         await process_and_reply(message)
 
@@ -377,7 +417,6 @@ async def handle_commands(message: types.Message, prefix: str = None):
     user = get_user(user_id)
     current_prefix = prefix or user["prefix"]
     text = message.text
-    # Убираем префикс
     if text.startswith(current_prefix):
         text = text[len(current_prefix):]
     elif text.startswith("/"):
@@ -399,45 +438,141 @@ async def handle_commands(message: types.Message, prefix: str = None):
             [InlineKeyboardButton(text="🖼 Медиа", callback_data="menu_media"),
              InlineKeyboardButton(text="📍 Мой пояс", callback_data="menu_timezone")],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu_settings"),
-             InlineKeyboardButton(text="📖 Полный список", callback_data="menu_full_help")],
-            [InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help")]
+             InlineKeyboardButton(text="📌 Как подключить", callback_data="menu_guide")],
+            [InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help"),
+             InlineKeyboardButton(text="📖 Полный список", callback_data="menu_full_help")]
         ])
         await message.reply(
-            "🤖 *Бот-помощник v2.0*\n\nЯ помогаю отвечать в твоих чатах, когда ты занят.\n\n✅ *Как настроить:*\n1. Нажми 📖 Полный список команд\n2. Настрой режим и фразы\n3. Подключи меня в *Настройки → Автоматизация чатов*\n\n⬇️ *Быстрые кнопки:*",
+            f"🤖 *{BOT_NAME} v2.0*\n\nЯ помогаю отвечать в твоих чатах, когда ты занят.\n\n✅ *Быстрый старт:*\n1. Нажми «📌 Как подключить»\n2. Подключи меня в настройках Telegram\n3. Настрой режим и правила\n4. Готово!\n\n⬇️ *Выбери действие:*",
             reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # guide
+    elif cmd == "guide":
+        await message.reply(
+            f"📌 *Как подключить {BOT_NAME}*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"*1.* Открой *Настройки Telegram*\n"
+            f"   (На Android/iOS: профиль → Настройки)\n\n"
+            f"*2.* Найди раздел *«Автоматизация чатов»*\n"
+            f"   (Иногда называется «Помощники» или «Боты-секретари»)\n\n"
+            f"*3.* Нажми *«Подключить бота»*\n\n"
+            f"*4.* Введи мой юзернейм:\n"
+            f"   `{BOT_USERNAME}`\n\n"
+            f"*5.* Выбери уровень доступа:\n"
+            f"   • *«Все личные чаты, кроме...»* — я буду везде, кроме исключений\n"
+            f"   • *«Только выбранные чаты»* — я буду только там, где разрешишь\n\n"
+            f"*6.* При необходимости добавь *исключения* (чат с девушкой, боссом и т.д.)\n\n"
+            f"*7.* Готово! Я появился в разделе\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ *После подключения* я пришлю уведомление\n"
+            f"📖 А пока можешь изучить команды: {current_prefix}help\n\n"
+            f"💡 *Важно:* Я НЕ читаю чаты без твоего разрешения. Ты всегда можешь отключить меня в тех же настройках.",
             parse_mode=ParseMode.MARKDOWN
         )
     
     # help
     elif cmd == "help":
-        await message.reply(
-            f"📚 *Справка*\n\n*Основные команды:*\n{current_prefix}on — включить\n{current_prefix}off — выключить\n{current_prefix}status — текущее состояние\n{current_prefix}set text <текст> — фраза для auto-режима\n\n*Режимы:*\n{current_prefix}mode auto — отвечать всегда\n{current_prefix}mode smart — только на вопросы\n{current_prefix}mode silent — не отвечать\n\n*Расписание:*\n{current_prefix}schedule morning <текст>\n{current_prefix}schedule day <текст>\n{current_prefix}schedule evening <текст>\n{current_prefix}schedule night <текст>\n\n*Правила:*\n{current_prefix}add rule <имя>\n{current_prefix}rule <имя> on слово <слово>\n{current_prefix}rule <имя> answer <текст>\n\n📖 *Полный список:* нажми кнопку в меню",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        if len(args) >= 1 and args[0] == "full":
+            await message.reply(
+                f"📖 *ПОЛНЫЙ СПИСОК КОМАНД {BOT_NAME}*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 *ОСНОВНЫЕ*\n"
+                f"{current_prefix}on — включить\n"
+                f"{current_prefix}off — выключить\n"
+                f"{current_prefix}status — статус\n"
+                f"{current_prefix}guide — как подключить\n\n"
+                f"🔹 *РЕЖИМЫ*\n"
+                f"{current_prefix}mode auto — отвечать всегда\n"
+                f"{current_prefix}mode smart — только на вопросы\n"
+                f"{current_prefix}mode silent — не отвечать\n\n"
+                f"🔹 *НАСТРОЙКА*\n"
+                f"{current_prefix}set text <текст> — фраза\n"
+                f"{current_prefix}current text — показать фразу\n"
+                f"{current_prefix}prefix . или / — сменить префикс\n\n"
+                f"🔹 *РАСПИСАНИЕ*\n"
+                f"{current_prefix}timezone +3 — пояс\n"
+                f"{current_prefix}schedule morning <текст>\n"
+                f"{current_prefix}schedule day <текст>\n"
+                f"{current_prefix}schedule evening <текст>\n"
+                f"{current_prefix}schedule night <текст>\n"
+                f"{current_prefix}schedule on/off\n\n"
+                f"🔹 *ПРАВИЛА*\n"
+                f"{current_prefix}add rule <имя> — создать\n"
+                f"{current_prefix}rule <имя> on слово <слово>\n"
+                f"{current_prefix}rule <имя> on вопрос\n"
+                f"{current_prefix}rule <имя> on срочно\n"
+                f"{current_prefix}rule <имя> answer <текст>\n"
+                f"{current_prefix}rule <имя> priority <1-10>\n"
+                f"{current_prefix}rule <имя> cooldown <мин>\n"
+                f"{current_prefix}list rules — показать\n"
+                f"{current_prefix}remove rule <имя> — удалить\n\n"
+                f"🔹 *МЕДИА*\n"
+                f"{current_prefix}media simple — отвечать на медиа\n"
+                f"{current_prefix}media off — игнорировать\n\n"
+                f"🔹 *СТАТИСТИКА*\n"
+                f"{current_prefix}stats — статистика\n"
+                f"{current_prefix}reset — сбросить\n"
+                f"{current_prefix}test <сообщение> — тест\n\n"
+                f"💡 *Пример создания правила:*\n"
+                f"{current_prefix}add rule клиент\n"
+                f"{current_prefix}rule клиент on слово цена\n"
+                f"{current_prefix}rule клиент answer Напишите телефон\n"
+                f"{current_prefix}rule клиент priority 1",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.reply(
+                f"📚 *Справка {BOT_NAME}*\n\n"
+                f"*Основные команды:*\n"
+                f"{current_prefix}on — включить\n"
+                f"{current_prefix}off — выключить\n"
+                f"{current_prefix}status — текущее состояние\n"
+                f"{current_prefix}set text <текст> — фраза для auto\n\n"
+                f"*Режимы:*\n"
+                f"{current_prefix}mode auto — отвечать всегда\n"
+                f"{current_prefix}mode smart — только на вопросы\n"
+                f"{current_prefix}mode silent — не отвечать\n\n"
+                f"*Правила (пример):*\n"
+                f"{current_prefix}add rule клиент\n"
+                f"{current_prefix}rule клиент on слово цена\n"
+                f"{current_prefix}rule клиент answer Напишите телефон\n\n"
+                f"📖 *Полный список:* {current_prefix}help full\n"
+                f"📌 *Как подключить:* {current_prefix}guide",
+                parse_mode=ParseMode.MARKDOWN
+            )
     
     # on
     elif cmd == "on":
         update_user(user_id, enabled=1)
-        await message.reply("✅ Помощник включён")
+        await message.reply(f"✅ *{BOT_NAME} включён*\n\nЯ буду отвечать в твоих чатах согласно настройкам.\n📌 Текущий префикс: `{current_prefix}`", parse_mode=ParseMode.MARKDOWN)
     
     # off
     elif cmd == "off":
         update_user(user_id, enabled=0)
-        await message.reply("❌ Помощник выключен")
+        await message.reply(
+            f"❌ *{BOT_NAME} выключен*\n\n"
+            f"Я больше не отвечаю в твоих чатах.\n\n"
+            f"💔 *Сожалею о покидании!*\n\n"
+            f"Если захочешь вернуться — напиши `{current_prefix}on`\n\n"
+            f"А пока ты можешь полностью отключить меня в *Настройки → Автоматизация чатов*, чтобы я не имел доступа к чатам.",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
     # status
     elif cmd == "status":
         rules = get_rules(user_id)
-        schedule = get_schedule(user_id)
         await message.reply(
-            f"📊 *Статус*\n"
-            f"Режим: {user['mode']}\n"
-            f"Включён: {'да' if user['enabled'] else 'нет'}\n"
-            f"Фраза: {user['default_text']}\n"
-            f"Правил: {len(rules)}\n"
-            f"Расписание: {'вкл' if user['schedule_enabled'] else 'выкл'}\n"
-            f"Медиа: {user['media_mode']}\n"
-            f"Префикс: {user['prefix']}",
+            f"📊 *Статус {BOT_NAME}*\n\n"
+            f"• Режим: `{user['mode']}`\n"
+            f"• Включён: {'✅ да' if user['enabled'] else '❌ нет'}\n"
+            f"• Фраза: `{user['default_text']}`\n"
+            f"• Правил: {len(rules)}\n"
+            f"• Расписание: {'✅ вкл' if user['schedule_enabled'] else '❌ выкл'}\n"
+            f"• Медиа: `{user['media_mode']}`\n"
+            f"• Префикс: `{current_prefix}`\n"
+            f"• Подключён в ТГ: {'✅ да' if user['is_connected'] else '❌ нет (напиши /guide)'}",
             parse_mode=ParseMode.MARKDOWN
         )
     
@@ -446,36 +581,42 @@ async def handle_commands(message: types.Message, prefix: str = None):
         mode = args[0]
         if mode in ["auto", "smart", "silent"]:
             update_user(user_id, mode=mode)
-            await message.reply(f"🎮 Режим изменён на {mode}")
+            mode_desc = {
+                "auto": "отвечаю на *каждое* сообщение",
+                "smart": "отвечаю *только на вопросы*",
+                "silent": "*не отвечаю* (только статистика)"
+            }
+            await message.reply(f"🎮 Режим изменён на *{mode}*\n\n{mode_desc[mode]}", parse_mode=ParseMode.MARKDOWN)
         else:
-            await message.reply("❌ Режим должен быть: auto, smart, silent")
+            await message.reply(f"❌ Ошибка. Режим должен быть: auto, smart, silent\n\nПример: `{current_prefix}mode auto`", parse_mode=ParseMode.MARKDOWN)
     
     # set text
     elif cmd == "set" and len(args) >= 2 and args[0] == "text":
         new_text = " ".join(args[1:])
         if new_text:
             update_user(user_id, default_text=new_text)
-            await message.reply(f"✅ Фраза установлена: {new_text}")
+            await message.reply(f"✅ Фраза установлена:\n\n«{new_text}»")
         else:
-            await message.reply("❌ Введите текст после set text")
+            await message.reply(f"❌ Введите текст после команды\n\nПример: `{current_prefix}set text Принял, скоро отвечу`", parse_mode=ParseMode.MARKDOWN)
     
     # current text
     elif cmd == "current" and len(args) >= 1 and args[0] == "text":
-        await message.reply(f"📝 Текущая фраза: {user['default_text']}")
+        await message.reply(f"📝 Текущая фраза:\n\n«{user['default_text']}»")
     
     # add rule
     elif cmd == "add" and len(args) >= 2 and args[0] == "rule":
         name = " ".join(args[1:])
-        await message.reply(
-            f"✅ Правило '{name}' создано.\n\n"
-            f"Теперь настройте его:\n"
-            f"{current_prefix}rule {name} on слово <слово>\n"
-            f"{current_prefix}rule {name} answer <текст>\n"
-            f"{current_prefix}rule {name} priority <1-10>\n"
-            f"{current_prefix}rule {name} cooldown <минуты>"
-        )
-        # Временно сохраняем правило с пустыми полями
         add_rule(user_id, name, "", "", "Ответ не задан", 5, 0)
+        await message.reply(
+            f"✅ *Правило «{name}» создано*\n\n"
+            f"Теперь добавьте условия и ответ:\n\n"
+            f"• Условие: `{current_prefix}rule {name} on слово привет`\n"
+            f"• Ответ: `{current_prefix}rule {name} answer И тебе привет!`\n"
+            f"• Приоритет: `{current_prefix}rule {name} priority 1`\n"
+            f"• Cooldown: `{current_prefix}rule {name} cooldown 60`\n\n"
+            f"📖 Все команды: `{current_prefix}help`",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
     # rule ... on ...
     elif cmd == "rule" and len(args) >= 4 and args[2] == "on":
@@ -483,17 +624,18 @@ async def handle_commands(message: types.Message, prefix: str = None):
         cond_type = args[3]
         cond_value = " ".join(args[4:]) if len(args) > 4 else ""
         
-        if cond_type not in ["слово", "фраза", "вопрос", "срочно", "медиа", "длина"]:
-            await message.reply("❌ Тип условия: слово, фраза, вопрос, срочно, медиа, длина")
+        valid_types = ["слово", "фраза", "вопрос", "срочно", "медиа"]
+        if cond_type not in valid_types:
+            await message.reply(f"❌ Неверный тип условия.\n\nДоступные типы: {', '.join(valid_types)}\n\nПример: `{current_prefix}rule {name} on слово цена`", parse_mode=ParseMode.MARKDOWN)
             return
         
         rules = get_rules(user_id)
         rule = next((r for r in rules if r["name"] == name), None)
         if rule:
             update_rule_condition(rule["id"], cond_type, cond_value)
-            await message.reply(f"✅ Условие для '{name}' обновлено: {cond_type} = {cond_value}")
+            await message.reply(f"✅ Условие для *{name}* обновлено:\n`{cond_type}` = `{cond_value}`", parse_mode=ParseMode.MARKDOWN)
         else:
-            await message.reply(f"❌ Правило '{name}' не найдено")
+            await message.reply(f"❌ Правило *{name}* не найдено.\n\nСначала создайте: `{current_prefix}add rule {name}`", parse_mode=ParseMode.MARKDOWN)
     
     # rule ... answer ...
     elif cmd == "rule" and len(args) >= 3 and args[2] == "answer":
@@ -503,9 +645,9 @@ async def handle_commands(message: types.Message, prefix: str = None):
         rule = next((r for r in rules if r["name"] == name), None)
         if rule:
             update_rule_answer(rule["id"], answer)
-            await message.reply(f"✅ Ответ для '{name}' установлен: {answer}")
+            await message.reply(f"✅ Ответ для *{name}* установлен:\n\n«{answer}»", parse_mode=ParseMode.MARKDOWN)
         else:
-            await message.reply(f"❌ Правило '{name}' не найдено")
+            await message.reply(f"❌ Правило *{name}* не найдено.\n\nСначала создайте: `{current_prefix}add rule {name}`", parse_mode=ParseMode.MARKDOWN)
     
     # rule ... priority ...
     elif cmd == "rule" and len(args) >= 3 and args[2] == "priority":
@@ -517,13 +659,13 @@ async def handle_commands(message: types.Message, prefix: str = None):
                 rule = next((r for r in rules if r["name"] == name), None)
                 if rule:
                     update_rule_priority(rule["id"], priority)
-                    await message.reply(f"✅ Приоритет для '{name}' установлен: {priority}")
+                    await message.reply(f"✅ Приоритет для *{name}* установлен: `{priority}`\n(1 — высший, 10 — низший)", parse_mode=ParseMode.MARKDOWN)
                 else:
-                    await message.reply(f"❌ Правило '{name}' не найдено")
+                    await message.reply(f"❌ Правило *{name}* не найдено", parse_mode=ParseMode.MARKDOWN)
             else:
-                await message.reply("❌ Приоритет должен быть от 1 до 10")
+                await message.reply("❌ Приоритет должен быть от 1 до 10\n\nПример: `priority 1` — высший приоритет")
         except:
-            await message.reply("❌ Использование: rule <имя> priority <число>")
+            await message.reply(f"❌ Использование: `{current_prefix}rule {name} priority 1`", parse_mode=ParseMode.MARKDOWN)
     
     # rule ... cooldown ...
     elif cmd == "rule" and len(args) >= 3 and args[2] == "cooldown":
@@ -534,21 +676,23 @@ async def handle_commands(message: types.Message, prefix: str = None):
             rule = next((r for r in rules if r["name"] == name), None)
             if rule:
                 update_rule_cooldown(rule["id"], cooldown)
-                await message.reply(f"✅ Cooldown для '{name}' установлен: {cooldown} мин")
+                await message.reply(f"✅ Cooldown для *{name}* установлен: `{cooldown}` минут\n(бот не будет отвечать повторно в том же чате это время)", parse_mode=ParseMode.MARKDOWN)
             else:
-                await message.reply(f"❌ Правило '{name}' не найдено")
+                await message.reply(f"❌ Правило *{name}* не найдено", parse_mode=ParseMode.MARKDOWN)
         except:
-            await message.reply("❌ Использование: rule <имя> cooldown <минуты>")
+            await message.reply(f"❌ Использование: `{current_prefix}rule {name} cooldown 60`", parse_mode=ParseMode.MARKDOWN)
     
     # list rules
     elif cmd == "list" and len(args) >= 1 and args[0] == "rules":
         rules = get_rules(user_id)
         if not rules:
-            await message.reply("📭 У вас нет правил")
+            await message.reply(f"📭 У вас нет правил\n\nСоздайте первое: `{current_prefix}add rule мое_правило`", parse_mode=ParseMode.MARKDOWN)
         else:
-            msg = "📋 *Ваши правила:*\n\n"
-            for r in rules:
-                msg += f"• *{r['name']}*: {r['condition_type']}='{r['condition_value']}' → {r['answer'][:40]}...\n  Приор:{r['priority']} | Cooldown:{r['cooldown']}мин\n"
+            msg = f"📋 *Ваши правила:*\n\n"
+            for r in rules[:10]:
+                msg += f"• *{r['name']}*: {r['condition_type']}='{r['condition_value'][:20]}' → {r['answer'][:30]}...\n  Приор:{r['priority']} | Cooldown:{r['cooldown']}мин\n"
+            if len(rules) > 10:
+                msg += f"\n... и ещё {len(rules)-10} правил"
             await message.reply(msg, parse_mode=ParseMode.MARKDOWN)
     
     # remove rule
@@ -558,37 +702,36 @@ async def handle_commands(message: types.Message, prefix: str = None):
         rule = next((r for r in rules if r["name"] == name), None)
         if rule:
             delete_rule(rule["id"])
-            await message.reply(f"✅ Правило '{name}' удалено")
+            await message.reply(f"✅ Правило *{name}* удалено", parse_mode=ParseMode.MARKDOWN)
         else:
-            await message.reply(f"❌ Правило '{name}' не найдено")
+            await message.reply(f"❌ Правило *{name}* не найдено\n\nСписок правил: `{current_prefix}list rules`", parse_mode=ParseMode.MARKDOWN)
     
     # schedule
     elif cmd == "schedule":
         if len(args) == 0:
             await message.reply(
                 f"📅 *Управление расписанием*\n\n"
-                f"{current_prefix}schedule morning <текст>\n"
-                f"{current_prefix}schedule day <текст>\n"
-                f"{current_prefix}schedule evening <текст>\n"
-                f"{current_prefix}schedule night <текст>\n"
-                f"{current_prefix}schedule list\n"
-                f"{current_prefix}schedule on\n"
-                f"{current_prefix}schedule off",
+                f"`{current_prefix}schedule morning <текст>` — утро (6-12)\n"
+                f"`{current_prefix}schedule day <текст>` — день (12-18)\n"
+                f"`{current_prefix}schedule evening <текст>` — вечер (18-24)\n"
+                f"`{current_prefix}schedule night <текст>` — ночь (0-6)\n"
+                f"`{current_prefix}schedule list` — показать\n"
+                f"`{current_prefix}schedule on/off` — включить/выключить",
                 parse_mode=ParseMode.MARKDOWN
             )
         elif args[0] in ["morning", "day", "evening", "night"] and len(args) >= 2:
             period = args[0]
             text_response = " ".join(args[1:])
             update_schedule(user_id, period, text_response)
-            await message.reply(f"✅ Фраза для {period} установлена")
+            await message.reply(f"✅ Фраза для *{period}* установлена", parse_mode=ParseMode.MARKDOWN)
         elif args[0] == "list":
             schedule = get_schedule(user_id)
             await message.reply(
                 f"📅 *Текущее расписание*\n\n"
-                f"🌅 Утро (6-12): {schedule['morning'] or 'не задано'}\n"
-                f"☀️ День (12-18): {schedule['day'] or 'не задано'}\n"
-                f"🌙 Вечер (18-24): {schedule['evening'] or 'не задано'}\n"
-                f"🌃 Ночь (0-6): {schedule['night'] or 'не задано'}",
+                f"🌅 Утро (6-12): {schedule['morning'] or '❌ не задано'}\n"
+                f"☀️ День (12-18): {schedule['day'] or '❌ не задано'}\n"
+                f"🌙 Вечер (18-24): {schedule['evening'] or '❌ не задано'}\n"
+                f"🌃 Ночь (0-6): {schedule['night'] or '❌ не задано'}",
                 parse_mode=ParseMode.MARKDOWN
             )
         elif args[0] == "on":
@@ -597,45 +740,49 @@ async def handle_commands(message: types.Message, prefix: str = None):
         elif args[0] == "off":
             update_user(user_id, schedule_enabled=0)
             await message.reply("❌ Расписание выключено")
+        else:
+            await message.reply(f"❌ Неизвестная команда расписания\n\nПример: `{current_prefix}schedule morning Доброе утро!`", parse_mode=ParseMode.MARKDOWN)
     
     # timezone
     elif cmd == "timezone":
         if len(args) == 0:
-            await message.reply(f"📍 Текущий часовой пояс: {user['timezone']}\n\nИспользование: {current_prefix}timezone +3\nИли {current_prefix}timezone Europe/Moscow")
+            await message.reply(f"📍 Текущий часовой пояс: `{user['timezone']}`\n\nИспользование: `{current_prefix}timezone +3`\nИли `{current_prefix}timezone Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
         else:
             new_tz = args[0]
             try:
-                # Проверяем, что часовой пояс существует
                 tz(new_tz)
                 update_user(user_id, timezone=new_tz)
-                await message.reply(f"✅ Часовой пояс установлен: {new_tz}")
+                await message.reply(f"✅ Часовой пояс установлен: `{new_tz}`", parse_mode=ParseMode.MARKDOWN)
             except:
-                await message.reply("❌ Неверный часовой пояс. Примеры: +3, Europe/Moscow, Asia/Yekaterinburg")
+                await message.reply(f"❌ Неверный часовой пояс.\n\nПримеры: `+3`, `Europe/Moscow`, `Asia/Yekaterinburg`", parse_mode=ParseMode.MARKDOWN)
     
     # media
     elif cmd == "media":
         if len(args) == 0:
             await message.reply(
-                f"🖼 *Медиа режим*\n\nТекущий: {user['media_mode']}\n\n"
-                f"{current_prefix}media simple — отвечать стандартной фразой\n"
-                f"{current_prefix}media off — не отвечать на медиа",
+                f"🖼 *Медиа режим*\n\nТекущий: `{user['media_mode']}`\n\n"
+                f"`{current_prefix}media simple` — отвечать стандартной фразой\n"
+                f"`{current_prefix}media off` — не отвечать на медиа\n\n"
+                f"*Simple режим:*\n• Фото → 📸 Фото принято\n• Голосовое → 🎤 Голосовое принято\n• Видео → 🎥 Видео принято\n• Файл → 📄 Файл принят",
                 parse_mode=ParseMode.MARKDOWN
             )
         elif args[0] in ["simple", "off"]:
             update_user(user_id, media_mode=args[0])
-            await message.reply(f"✅ Медиа режим изменён на {args[0]}")
+            await message.reply(f"✅ Медиа режим изменён на `{args[0]}`", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await message.reply(f"❌ Неверный режим. Используйте: simple или off")
     
     # prefix
     elif cmd == "prefix":
         if len(args) == 0:
-            await message.reply(f"⚙️ Текущий префикс: {user['prefix']}\n\nИспользование: {current_prefix}prefix .\nИли {current_prefix}prefix /")
+            await message.reply(f"⚙️ Текущий префикс: `{user['prefix']}`\n\nИспользование: `{current_prefix}prefix .`\nИли `{current_prefix}prefix /`", parse_mode=ParseMode.MARKDOWN)
         else:
             new_prefix = args[0]
             if new_prefix in [".", "/"]:
                 update_user(user_id, prefix=new_prefix)
-                await message.reply(f"✅ Префикс команд изменён на {new_prefix}\n\nТеперь используйте {new_prefix}help для справки")
+                await message.reply(f"✅ Префикс команд изменён на `{new_prefix}`\n\nТеперь используйте `{new_prefix}help` для справки", parse_mode=ParseMode.MARKDOWN)
             else:
-                await message.reply("❌ Префикс должен быть . или /")
+                await message.reply("❌ Префикс должен быть `.` или `/`")
     
     # stats
     elif cmd == "stats":
@@ -672,37 +819,29 @@ async def handle_commands(message: types.Message, prefix: str = None):
         if matched:
             await message.reply(
                 f"🧪 *Тест*\n\n"
-                f"Сообщение: {test_msg}\n\n"
-                f"✅ Правило '{matched['name']}'\n"
+                f"Сообщение: `{test_msg}`\n\n"
+                f"✅ Правило *{matched['name']}*\n"
                 f"Ответ: {matched['answer']}",
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
             await message.reply(
                 f"🧪 *Тест*\n\n"
-                f"Сообщение: {test_msg}\n\n"
+                f"Сообщение: `{test_msg}`\n\n"
                 f"❌ Ни одно правило не подошло\n"
-                f"Базовый режим: {user['mode']}",
+                f"Базовый режим: `{user['mode']}`",
                 parse_mode=ParseMode.MARKDOWN
             )
     
-    # guide
-    elif cmd == "guide":
+    else:
         await message.reply(
-            "📌 *Как подключить бота в чаты:*\n\n"
-            "1. Открой Настройки Telegram\n"
-            "2. Найди раздел «Автоматизация чатов»\n"
-            "3. Нажми «Подключить бота»\n"
-            "4. Введи моё имя @your_bot_username\n"
-            "5. Выбери «Все чаты, кроме...» или «Только выбранные»\n"
-            "6. Отметь нужные чаты или исключения\n\n"
-            "После этого я буду отвечать в выбранных чатах!",
+            f"❌ Неизвестная команда.\n\n"
+            f"Напишите `{current_prefix}help` для списка команд\n"
+            f"Или `{current_prefix}guide` для инструкции по подключению",
             parse_mode=ParseMode.MARKDOWN
         )
-    
-    else:
-        await message.reply(f"❌ Неизвестная команда. Напишите {current_prefix}help")
 
+# ========== CALLBACKS ==========
 @dp.callback_query()
 async def handle_callbacks(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -715,7 +854,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
         await callback.message.edit_text("✅ Помощник включён")
     elif data == "toggle_off":
         update_user(user_id, enabled=0)
-        await callback.message.edit_text("❌ Помощник выключен")
+        await callback.message.edit_text("❌ Помощник выключен\n\n💔 Сожалею о покидании!", parse_mode=ParseMode.MARKDOWN)
     
     elif data == "menu_modes":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -724,7 +863,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
              InlineKeyboardButton(text="🤫 Silent", callback_data="mode_silent")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
         ])
-        await callback.message.edit_text("🎮 *Выберите режим:*", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+        await callback.message.edit_text("🎮 *Выберите режим:*\n\n• Auto — отвечаю всегда\n• Smart — только на вопросы\n• Silent — молчу", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     
     elif data == "mode_auto":
         update_user(user_id, mode="auto")
@@ -749,40 +888,98 @@ async def handle_callbacks(callback: types.CallbackQuery):
              InlineKeyboardButton(text="🔘 / (слеш)", callback_data="prefix_slash")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_settings")]
         ])
-        await callback.message.edit_text(f"⚙️ *Смена префикса*\n\nТекущий: {user['prefix']}\n\nВыберите новый:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+        await callback.message.edit_text(f"⚙️ *Смена префикса*\n\nТекущий: `{user['prefix']}`\n\nВыберите новый:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     
     elif data == "prefix_dot":
         update_user(user_id, prefix=".")
-        await callback.message.edit_text("✅ Префикс изменён на .\n\nТеперь используйте .help для команд")
+        await callback.message.edit_text("✅ Префикс изменён на `.`\n\nТеперь используйте `.help` для команд")
     elif data == "prefix_slash":
         update_user(user_id, prefix="/")
-        await callback.message.edit_text("✅ Префикс изменён на /\n\nТеперь используйте /help для команд")
+        await callback.message.edit_text("✅ Префикс изменён на `/`\n\nТеперь используйте `/help` для команд")
+    
+    elif data == "menu_guide":
+        await callback.message.edit_text(
+            f"📌 *Как подключить {BOT_NAME}*\n\n"
+            f"1. Настройки Telegram → Автоматизация чатов\n"
+            f"2. Нажми «Подключить бота»\n"
+            f"3. Введи `{BOT_USERNAME}`\n"
+            f"4. Выбери доступ (все чаты или только выбранные)\n"
+            f"5. Готово!\n\n"
+            f"После подключения я пришлю приветствие.\n\n"
+            f"📖 Команды: `{prefix}help`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
+        )
+    
+    elif data == "menu_help":
+        await callback.message.edit_text(
+            f"📚 *Справка*\n\n"
+            f"`{prefix}on` — включить\n"
+            f"`{prefix}off` — выключить\n"
+            f"`{prefix}status` — статус\n"
+            f"`{prefix}mode auto/smart/silent`\n"
+            f"`{prefix}set text <текст>`\n"
+            f"`{prefix}add rule <имя>`\n"
+            f"`{prefix}list rules`\n\n"
+            f"📖 Полный список: `{prefix}help full`\n"
+            f"📌 Как подключить: `{prefix}guide`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
+        )
+    
+    elif data == "menu_full_help":
+        await callback.message.edit_text(
+            f"📖 *ПОЛНЫЙ СПИСОК КОМАНД*\n\n"
+            f"`{prefix}on` — включить\n`{prefix}off` — выключить\n"
+            f"`{prefix}status` — статус\n`{prefix}guide` — как подключить\n"
+            f"`{prefix}mode auto/smart/silent` — режимы\n"
+            f"`{prefix}set text <текст>` — фраза\n"
+            f"`{prefix}prefix . или /` — сменить префикс\n"
+            f"`{prefix}add rule <имя>` — создать правило\n"
+            f"`{prefix}rule <имя> on слово <слово>`\n"
+            f"`{prefix}rule <имя> answer <текст>`\n"
+            f"`{prefix}list rules` — список\n"
+            f"`{prefix}remove rule <имя>` — удалить\n"
+            f"`{prefix}schedule morning/day/evening/night <текст>`\n"
+            f"`{prefix}timezone +3` — часовой пояс\n"
+            f"`{prefix}stats` — статистика\n"
+            f"`{prefix}test <сообщение>` — тест",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
+        )
     
     elif data == "menu_rules":
         rules = get_rules(user_id)
         if not rules:
-            await callback.message.edit_text("📭 У вас нет правил\n\nСоздайте: .add rule <имя>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]]))
+            await callback.message.edit_text(
+                f"📭 У вас нет правил\n\nСоздайте: `{prefix}add rule <имя>`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
+            )
         else:
-            msg = "📋 *Ваши правила:*\n\n"
+            msg = f"📋 *Ваши правила:*\n\n"
             for r in rules[:5]:
-                msg += f"• {r['name']}: {r['condition_type']} → {r['answer'][:30]}...\n"
-            msg += f"\nВсего: {len(rules)} правил\n\nКоманда: {prefix}list rules"
+                msg += f"• *{r['name']}*: {r['condition_type']} → {r['answer'][:30]}...\n"
+            msg += f"\nВсего: {len(rules)} правил\n\n`{prefix}list rules` — все"
             await callback.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]]))
     
     elif data == "menu_stats":
         stats = get_stats(user_id)
-        await callback.message.edit_text(f"📊 *Статистика*\n\nПолучено: {stats['received']}\nОтвечено: {stats['answered']}\nПоследнее: {stats['last'] or 'нет'}", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]]))
+        await callback.message.edit_text(
+            f"📊 *Статистика*\n\nПолучено: {stats['received']}\nОтвечено: {stats['answered']}\nПоследнее: {stats['last'] or 'нет'}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
+        )
     
     elif data == "menu_schedule":
         schedule = get_schedule(user_id)
         await callback.message.edit_text(
             f"📅 *Расписание*\n\n"
-            f"Статус: {'включено' if user['schedule_enabled'] else 'выключено'}\n"
+            f"Статус: {'✅ включено' if user['schedule_enabled'] else '❌ выключено'}\n"
             f"Утро: {schedule['morning'] or 'не задано'}\n"
             f"День: {schedule['day'] or 'не задано'}\n"
             f"Вечер: {schedule['evening'] or 'не задано'}\n"
-            f"Ночь: {schedule['night'] or 'не задано'}\n\n"
-            f"Команда: {prefix}schedule on/off",
+            f"Ночь: {schedule['night'] or 'не задано'}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🕐 Вкл", callback_data="schedule_on"),
@@ -800,11 +997,9 @@ async def handle_callbacks(callback: types.CallbackQuery):
     
     elif data == "menu_media":
         await callback.message.edit_text(
-            f"🖼 *Медиа режим*\n\n"
-            f"Текущий: {user['media_mode']}\n\n"
-            f"simple — отвечать стандартной фразой\n"
-            f"off — не отвечать на медиа\n\n"
-            f"Команда: {prefix}media simple/off",
+            f"🖼 *Медиа режим*\n\nТекущий: `{user['media_mode']}`\n\n"
+            f"`simple` — отвечать стандартной фразой\n"
+            f"`off` — не отвечать на медиа",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🖼 Simple", callback_data="media_simple"),
@@ -822,75 +1017,9 @@ async def handle_callbacks(callback: types.CallbackQuery):
     
     elif data == "menu_timezone":
         await callback.message.edit_text(
-            f"📍 *Часовой пояс*\n\nТекущий: {user['timezone']}\n\n"
-            f"Установите командой:\n{prefix}timezone +3\n"
-            f"Или {prefix}timezone Europe/Moscow",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
-        )
-    
-    elif data == "menu_help":
-        await callback.message.edit_text(
-            f"📚 *Справка*\n\n"
-            f"{prefix}on — включить\n"
-            f"{prefix}off — выключить\n"
-            f"{prefix}status — статус\n"
-            f"{prefix}mode auto/smart/silent\n"
-            f"{prefix}set text <текст>\n"
-            f"{prefix}add rule <имя>\n"
-            f"{prefix}list rules\n\n"
-            f"📖 Полный список — в главном меню",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
-        )
-    
-    elif data == "menu_full_help":
-        await callback.message.edit_text(
-            f"📖 *ПОЛНЫЙ СПИСОК КОМАНД*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🔹 *ОСНОВНЫЕ*\n"
-            f"{prefix}on — включить\n"
-            f"{prefix}off — выключить\n"
-            f"{prefix}status — текущий статус\n"
-            f"{prefix}guide — как подключить\n\n"
-            f"🔹 *РЕЖИМЫ*\n"
-            f"{prefix}mode auto — отвечать всегда\n"
-            f"{prefix}mode smart — только на вопросы\n"
-            f"{prefix}mode silent — не отвечать\n\n"
-            f"🔹 *НАСТРОЙКА*\n"
-            f"{prefix}set text <текст> — фраза для auto\n"
-            f"{prefix}current text — показать фразу\n"
-            f"{prefix}prefix . или / — сменить префикс\n\n"
-            f"🔹 *РАСПИСАНИЕ*\n"
-            f"{prefix}timezone +3 — установить пояс\n"
-            f"{prefix}schedule morning <текст>\n"
-            f"{prefix}schedule day <текст>\n"
-            f"{prefix}schedule evening <текст>\n"
-            f"{prefix}schedule night <текст>\n"
-            f"{prefix}schedule on/off\n\n"
-            f"🔹 *ПРАВИЛА*\n"
-            f"{prefix}add rule <имя> — создать\n"
-            f"{prefix}rule <имя> on слово <слово>\n"
-            f"{prefix}rule <имя> on вопрос\n"
-            f"{prefix}rule <имя> on срочно\n"
-            f"{prefix}rule <имя> on медиа фото\n"
-            f"{prefix}rule <имя> answer <текст>\n"
-            f"{prefix}rule <имя> priority <1-10>\n"
-            f"{prefix}rule <имя> cooldown <мин>\n"
-            f"{prefix}list rules — показать\n"
-            f"{prefix}remove rule <имя> — удалить\n\n"
-            f"🔹 *СТАТИСТИКА*\n"
-            f"{prefix}stats — статистика\n"
-            f"{prefix}reset — сбросить\n"
-            f"{prefix}test <сообщение> — тест\n\n"
-            f"🔹 *МЕДИА*\n"
-            f"{prefix}media simple — отвечать на медиа\n"
-            f"{prefix}media off — игнорировать\n\n"
-            f"💡 *Пример правила:*\n"
-            f"{prefix}add rule клиент\n"
-            f"{prefix}rule клиент on слово цена\n"
-            f"{prefix}rule клиент answer Напишите телефон\n"
-            f"{prefix}rule клиент priority 1",
+            f"📍 *Часовой пояс*\n\nТекущий: `{user['timezone']}`\n\n"
+            f"Установите командой:\n`{prefix}timezone +3`\n"
+            f"Или `{prefix}timezone Europe/Moscow`",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]])
         )
@@ -906,16 +1035,18 @@ async def handle_callbacks(callback: types.CallbackQuery):
             [InlineKeyboardButton(text="🖼 Медиа", callback_data="menu_media"),
              InlineKeyboardButton(text="📍 Мой пояс", callback_data="menu_timezone")],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu_settings"),
-             InlineKeyboardButton(text="📖 Полный список", callback_data="menu_full_help")],
-            [InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help")]
+             InlineKeyboardButton(text="📌 Как подключить", callback_data="menu_guide")],
+            [InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help"),
+             InlineKeyboardButton(text="📖 Полный список", callback_data="menu_full_help")]
         ])
-        await callback.message.edit_text("🤖 *Бот-помощник v2.0*\n\nВыберите действие:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+        await callback.message.edit_text(f"🤖 *{BOT_NAME} v2.0*\n\nВыберите действие:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     
     await callback.answer()
 
 async def main():
-    print("🚀 Бот-помощник запущен...")
-    print("Поддерживаемые команды:")
+    print(f"🚀 {BOT_NAME} запущен...")
+    print(f"📍 Бот: {BOT_USERNAME}")
+    print("✅ Готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
